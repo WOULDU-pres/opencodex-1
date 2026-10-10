@@ -531,6 +531,59 @@ test("overlapping reconnects for one link restart it once and keep the new child
   await supervisor.stop();
 });
 
+test("a link stopped for removal stays held against reconnect and the tick until the next reload", async () => {
+  const fake = fakeRunner();
+  const timers: Array<() => void> = [];
+  let current = 0;
+  const store = baseStore(record("hub-initiated", "lnk_0123456789abcdef"));
+  const supervisor = createLinkSupervisor({
+    readStore: () => store,
+    runner: fake.runner,
+    pidfileDir: "/tmp/opencodex-link-supervisor-test",
+    now: () => current,
+    setTimer: callback => { timers.push(callback); return 1 as unknown as ReturnType<typeof setInterval>; },
+    clearTimer: () => {},
+  });
+  supervisor.start();
+  current = 5_000;
+  timers[0]!();
+  await supervisor.stopLink("lnk_0123456789abcdef");
+  expect(await supervisor.reconnect("lnk_0123456789abcdef")).toBe(false);
+  for (; current < 400_000; current += 1_000) timers[0]!();
+  expect(fake.children).toHaveLength(1);
+  // A failed remote disconnect restarts the tunnel through reload, which ends the hold.
+  await supervisor.reload();
+  expect(fake.children).toHaveLength(2);
+  await supervisor.stop();
+});
+
+test("a reconnect that overlaps a removal does not start a replacement tunnel", async () => {
+  const fake = fakeRunner();
+  const timers: Array<() => void> = [];
+  let current = 0;
+  const store = baseStore(record("hub-initiated", "lnk_0123456789abcdef"));
+  const supervisor = createLinkSupervisor({
+    readStore: () => store,
+    runner: fake.runner,
+    pidfileDir: "/tmp/opencodex-link-supervisor-test",
+    now: () => current,
+    setTimer: callback => { timers.push(callback); return 1 as unknown as ReturnType<typeof setInterval>; },
+    clearTimer: () => {},
+  });
+  supervisor.start();
+  current = 5_000;
+  timers[0]!();
+  (fake.children[0]!.child as { kill: () => void }).kill = () => {};
+  const reconnect = supervisor.reconnect("lnk_0123456789abcdef");
+  const removal = supervisor.stopLink("lnk_0123456789abcdef");
+  fake.children[0]!.resolve(143);
+  expect(await reconnect).toBe(false);
+  await removal;
+  expect(fake.children).toHaveLength(1);
+  expect(supervisor.status()[0]).toMatchObject({ state: { kind: "idle" }, pid: null });
+  await supervisor.stop();
+});
+
 test("a reload neither skips the reconnect backoff nor a failed link's retry delay", async () => {
   const fake = fakeRunner();
   const timers: Array<() => void> = [];

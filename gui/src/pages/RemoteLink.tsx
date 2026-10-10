@@ -368,10 +368,10 @@ export default function RemoteLink({ apiBase, sessionReady, workspaceAvailable =
       for (const row of rows) await requestLinkJson<{ linkId: string }>(apiBase, `/api/link/${encodeURIComponent(row.id)}/reconnect`, { method: "POST" });
     } catch (error) {
       setActionError(linkActionError(error));
-    } finally {
-      setBusy(null);
-      await refreshStatus();
     }
+    // Retry stays disabled until the status shows the restarted attempt; a second click before
+    // that would kill the tunnel this one just started.
+    try { await refreshStatus(); } finally { setBusy(null); }
   };
 
   const retryFailedAction = () => {

@@ -34,6 +34,10 @@ export interface LinkSupervisor {
   start(): void;
   ensureStarted(): Promise<void>;
   reload(): Promise<void>;
+  /**
+   * Stop one link's tunnel for removal or compensation. The link stays held, so neither the tick
+   * nor `reconnect` starts it again, until the next `reload()`.
+   */
   stopLink(linkId: string): Promise<void>;
   /**
    * Restart one Home-initiated tunnel now: stop its child, forget the backoff or failed state,
@@ -157,6 +161,8 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
   const generations = new Map<string, number>();
   /** Reconnects in flight, so overlapping requests for one link restart it once. */
   const reconnects = new Map<string, Promise<boolean>>();
+  /** Links stopped through `stopLink` for removal or compensation; released by the next reload. */
+  const held = new Set<string>();
   const orphanUnverified = new Set<string>();
   /** The generation of the child whose exit is still being classified, per link. */
   const exiting = new Map<string, number>();
@@ -220,7 +226,7 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
   };
 
   const spawnFor = (record: LinkRecord): void => {
-    if (stopping || record.direction !== "hub-initiated" || children.has(record.id)) return;
+    if (stopping || record.direction !== "hub-initiated" || children.has(record.id) || held.has(record.id)) return;
     // Only a fresh link or a due attempt spawns. A reload must neither skip the backoff nor start
     // a second child while an exited one is still reporting its stderr.
     const prior = states.get(record.id);
@@ -351,7 +357,7 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
     return lifecycleFlight;
   };
 
-  const stopLink = async (linkId: string): Promise<void> => {
+  const stopChild = async (linkId: string): Promise<void> => {
     const current = children.get(linkId);
     if (!current) {
       states.set(linkId, IDLE);
@@ -377,6 +383,9 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
     async reload() {
       await runLifecycle(async () => {
         if (stopping) return;
+        // A reload re-reads the store, so it is where a removal's hold ends: a removed link is gone
+        // from the store, and a retained one (a failed remote disconnect) is supervised again.
+        held.clear();
         if (!started) {
           begin();
           return;
@@ -392,7 +401,7 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         store = nextStore;
         for (const [linkId] of [...children]) {
           if (nextInstances.has(linkId) && !changed.has(linkId)) continue;
-          await stopLink(linkId);
+          await stopChild(linkId);
           states.delete(linkId);
           orphanUnverified.delete(linkId);
           recordInstances.delete(linkId);
@@ -413,7 +422,10 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         syncTimer();
       });
     },
-    stopLink,
+    async stopLink(linkId: string) {
+      held.add(linkId);
+      await stopChild(linkId);
+    },
     reconnect(linkId: string) {
       const inFlight = reconnects.get(linkId);
       if (inFlight) return inFlight;
@@ -421,11 +433,12 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         // runLifecycle keeps only the latest queued operation, so a reconnect waits for a running
         // reload instead of queueing behind it where a second reload could replace it.
         if (lifecycleFlight) await lifecycleFlight;
-        if (stopping || !started) return false;
+        if (stopping || !started || held.has(linkId)) return false;
         const record = store.links.find(link => link.id === linkId && link.direction === "hub-initiated");
         if (!record) return false;
-        await stopLink(linkId);
-        if (stopping) return false;
+        await stopChild(linkId);
+        // A removal that stopped this link meanwhile holds it; do not resurrect its tunnel.
+        if (stopping || held.has(linkId)) return false;
         spawnFor(record);
         return true;
       })().finally(() => { reconnects.delete(linkId); });

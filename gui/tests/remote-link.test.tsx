@@ -538,9 +538,12 @@ test("disconnect failure opens force confirmation and sends force body", async (
 test("Retry on a failed Home link restarts its tunnel instead of only re-reading status", async () => {
   const calls: Array<{ method: string; path: string }> = [];
   let state: "failed" | "connecting" = "failed";
+  let releaseRefresh: (() => void) | null = null;
   globalThis.fetch = (async (input, init) => {
     const path = new URL(String(input)).pathname;
     calls.push({ method: init?.method ?? "GET", path });
+    // The status read after the reconnect is slow; Retry must stay disabled until it lands.
+    if (path === "/api/link/status" && state === "connecting") await new Promise<void>(resolve => { releaseRefresh = resolve; });
     if (path === "/api/link/status") return response({ ...baseStatus, links: [
       { id: "link-1", alias: "child", direction: "hub-initiated", state, since: "now", reason: state === "failed" ? "timeout" : null, tunnelPort: 43110 },
       { id: "link-2", alias: "home", direction: "client-initiated", state: "failed", since: "now", reason: "timeout", tunnelPort: 43111 },
@@ -551,6 +554,10 @@ test("Retry on a failed Home link restarts its tunnel instead of only re-reading
   const host = await mount();
   const retry = [...host.querySelectorAll("button")].find(button => button.textContent === "Retry") as HTMLButtonElement;
   await act(async () => { retry.click(); });
+  await settleUntil(() => releaseRefresh !== null);
+  expect(retry.disabled).toBe(true);
+  expect(calls.filter(call => call.method === "POST")).toHaveLength(1);
+  await act(async () => { releaseRefresh?.(); });
   await settleUntil(() => host.querySelector(".remote-link-status[data-state='connecting']") !== null);
   expect(calls.filter(call => call.method === "POST").map(call => call.path)).toEqual(["/api/link/link-1/reconnect"]);
   expect(calls.at(-1)).toEqual({ method: "GET", path: "/api/link/status" });
